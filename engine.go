@@ -21,6 +21,7 @@ type engine struct {
 
 	mu           sync.Mutex
 	calls        map[string]*engineCall
+	acceptCall   func(context.Context, string) error
 	setCallVideo func(context.Context, string, types.CallVideoState, *int) error
 	setCallMute  func(context.Context, string, bool) error
 }
@@ -33,23 +34,28 @@ type engineCall struct {
 	peerLID string
 	from    types.JID
 
-	direction        CallDirection
-	codec            AudioCodec
-	localVideo       bool
-	remoteVideo      bool
-	videoGate        bool
-	peerVideoUpgrade bool
-	videoTx          *videoSender
-	appDataTx        *appDataSender
-	rekeyPeer        func(string) error
-	started          bool
-	ended            bool
-	cancel           context.CancelFunc
+	direction           CallDirection
+	codec               AudioCodec
+	localVideo          bool
+	remoteVideo         bool
+	videoGate           bool
+	peerVideoUpgrade    bool
+	videoTx             *videoSender
+	appDataTx           *appDataSender
+	rekeyPeer           func(string) error
+	rebindRelay         func()
+	answerRequested     bool
+	answerSent          bool
+	mediaTransportReady bool
+	started             bool
+	ended               bool
+	cancel              context.CancelFunc
 }
 
 func newEngine(c *Client) *engine {
 	e := &engine{c: c, calls: make(map[string]*engineCall)}
 	if c != nil && c.wa != nil {
+		e.acceptCall = c.wa.AcceptCall
 		e.setCallVideo = c.wa.SetCallVideo
 		e.setCallMute = c.wa.SetCallMute
 	}
@@ -553,11 +559,49 @@ func (e *engine) onMediaStop(ev *events.CallMediaStop) {
 }
 
 func (e *engine) answer(c *Call) error {
-	if err := e.c.wa.AcceptCall(context.Background(), c.id); err != nil {
-		return fmt.Errorf("meowcaller: accept call: %w", err)
+	e.mu.Lock()
+	m := e.calls[c.id]
+	if m == nil || m.direction != CallDirectionIncoming || m.ended {
+		e.mu.Unlock()
+		return errors.New("meowcaller: incoming call is not active")
 	}
+	m.answerRequested = true
+	e.mu.Unlock()
 	c.setPhase(CallPhaseConnecting)
+	e.maybeAcceptIncoming(c.id)
 	return nil
+}
+
+func (e *engine) maybeAcceptIncoming(callID string) {
+	e.mu.Lock()
+	m := e.calls[callID]
+	if m == nil || m.ended || !m.answerRequested || !m.mediaTransportReady || m.answerSent {
+		e.mu.Unlock()
+		return
+	}
+	m.answerSent = true
+	rebind := m.rebindRelay
+	e.mu.Unlock()
+	if rebind != nil {
+		rebind()
+	}
+	if e.acceptCall == nil {
+		e.finishCall(callID, "accept_unavailable")
+		return
+	}
+	if err := e.acceptCall(context.Background(), callID); err != nil {
+		e.c.log.Warn().Err(err).Str("call_id", callID).Msg("failed to accept relay-ready incoming call")
+		e.finishCall(callID, "accept_failed")
+	}
+}
+
+func (e *engine) markMediaTransportReady(callID string) {
+	e.mu.Lock()
+	if m := e.calls[callID]; m != nil {
+		m.mediaTransportReady = true
+	}
+	e.mu.Unlock()
+	e.maybeAcceptIncoming(callID)
 }
 
 func (e *engine) reject(c *Call) error {

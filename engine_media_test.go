@@ -178,6 +178,51 @@ func TestMediaSrtcpSenderProtectsVideoReport(t *testing.T) {
 	}
 }
 
+func TestMediaSrtcpSenderProtectsCompactAudioReport(t *testing.T) {
+	callKey := iota32()
+	const localSSRC = 0x55667788
+	const remoteSSRC = 0x11223344
+	sender, err := newMediaSrtcpSender(callKey, "111111111111111:0@lid", localSSRC, false)
+	if err != nil {
+		t.Fatalf("sender: %v", err)
+	}
+	receiver, err := newMediaSrtcpReceiver(callKey, "111111111111111:0@lid")
+	if err != nil {
+		t.Fatalf("receiver: %v", err)
+	}
+	packet209, err := sender.compactReport209()
+	if err != nil {
+		t.Fatalf("compact 209 report: %v", err)
+	}
+	plain209, index209, ok := receiver.unprotect(localSSRC, packet209)
+	if !ok {
+		t.Fatal("compact 209 report failed authentication")
+	}
+	if index209 != 0 {
+		t.Fatalf("compact 209 report index = %d, want 0", index209)
+	}
+	want209 := rtp.BuildCompactRtcp209(localSSRC)
+	if !bytes.Equal(plain209, want209[:]) {
+		t.Fatalf("compact 209 report = %x, want %x", plain209, want209)
+	}
+
+	packet, err := sender.compactReport208(remoteSSRC)
+	if err != nil {
+		t.Fatalf("compact 208 report: %v", err)
+	}
+	plain, index, ok := receiver.unprotect(localSSRC, packet)
+	if !ok {
+		t.Fatal("compact 208 report failed authentication")
+	}
+	if index != 1 {
+		t.Fatalf("compact 208 report index = %d, want 1", index)
+	}
+	want := rtp.BuildCompactRtcp208(localSSRC, remoteSSRC)
+	if !bytes.Equal(plain, want[:]) {
+		t.Fatalf("compact 208 report = %x, want %x", plain, want)
+	}
+}
+
 func TestMediaSrtcpReceiverRekeysForAnsweringDevice(t *testing.T) {
 	callKey := iota32()
 	const ssrc = 0x55667788

@@ -2,6 +2,7 @@ package meowcaller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"go.mau.fi/whatsmeow/types"
@@ -21,6 +22,43 @@ func testEngineWithOutgoingCall() (*engine, *Call) {
 		codec:       AudioCodecMlow,
 	}
 	return c.eng, call
+}
+
+func testEngineWithIncomingCall() (*engine, *Call) {
+	c := &Client{}
+	c.eng = newEngine(c)
+	call := &Call{eng: c.eng, id: "CID", peer: peerJID(), phase: CallPhaseRinging}
+	c.eng.calls[call.ID()] = &engineCall{
+		call:      call,
+		direction: CallDirectionIncoming,
+		from:      peerJID(),
+	}
+	return c.eng, call
+}
+
+func TestIncomingAnswerWaitsForRelayTransport(t *testing.T) {
+	eng, call := testEngineWithIncomingCall()
+	var order []string
+	eng.calls[call.ID()].rebindRelay = func() { order = append(order, "rebind") }
+	eng.acceptCall = func(_ context.Context, callID string) error {
+		if callID != call.ID() {
+			t.Fatalf("accepted call %q, want %q", callID, call.ID())
+		}
+		order = append(order, "accept")
+		return nil
+	}
+
+	if err := call.Answer(); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	if len(order) != 0 {
+		t.Fatalf("answer sent before media transport: %v", order)
+	}
+	eng.markMediaTransportReady(call.ID())
+	eng.markMediaTransportReady(call.ID())
+	if got, want := fmt.Sprint(order), "[rebind accept]"; got != want {
+		t.Fatalf("answer order = %s, want %s", got, want)
+	}
 }
 
 func senderVideoState(sender *videoSender) (active, gated bool) {

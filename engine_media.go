@@ -54,10 +54,10 @@ func (e *engine) maybeStartMedia(callID string) {
 }
 
 // connectAndAllocate opens the relay DataChannel and sends the STUN allocate, returning
-// the channel and the allocate bytes (re-sent by the keepalive).
+// the channel and a builder for fresh authenticated Allocate transactions.
 //
 // NOT VALIDATED: live-relay only.
-func (e *engine) connectAndAllocate(ctx context.Context, ep *types.RelayEndpoint, streamSsrcs [9]uint32) (*relay.RelayMediaChannel, []byte, error) {
+func (e *engine) connectAndAllocate(ctx context.Context, ep *types.RelayEndpoint, streamSsrcs [9]uint32) (*relay.RelayMediaChannel, func() []byte, error) {
 	log := e.c.log
 	if ep == nil || ep.IPv4 == "" || ep.Port == 0 {
 		return nil, nil, fmt.Errorf("relay has no usable endpoint")
@@ -110,9 +110,12 @@ func (e *engine) connectAndAllocate(ctx context.Context, ep *types.RelayEndpoint
 		ch.Close()
 		return nil, nil, fmt.Errorf("bad endpoint XOR")
 	}
-	var tx [12]byte
-	_, _ = rand.Read(tx[:])
-	allocate := stun.BuildWasmStunAllocateRequestWithStreamSsrcs(tx, ep.Token, endpointXor, streamSsrcs, ep.Key, log)
+	buildAllocate := func() []byte {
+		var tx [12]byte
+		_, _ = rand.Read(tx[:])
+		return stun.BuildWasmStunAllocateRequestWithStreamSsrcs(tx, ep.Token, endpointXor, streamSsrcs, ep.Key, log)
+	}
+	allocate := buildAllocate()
 	if _, err := ch.Send(allocate); err != nil {
 		ch.Close()
 		return nil, nil, fmt.Errorf("allocate send: %w", err)
@@ -120,10 +123,10 @@ func (e *engine) connectAndAllocate(ctx context.Context, ep *types.RelayEndpoint
 	log.Info().Int("bytes", len(allocate)).Msg("sent STUN allocate")
 	e.c.diag.Emit("stun", map[string]any{
 		"event": "allocate_sent", "bytes": len(allocate),
-		"tx_id_hex": hex.EncodeToString(tx[:]), "allocate_hex": hex.EncodeToString(allocate),
+		"tx_id_hex": hex.EncodeToString(allocate[8:20]), "allocate_hex": hex.EncodeToString(allocate),
 		"stream_ssrcs": streamSsrcs,
 	})
-	return ch, allocate, nil
+	return ch, buildAllocate, nil
 }
 
 // runMedia runs the per-frame media loop over the relay DataChannel: the Player's frames
@@ -137,6 +140,7 @@ func (e *engine) connectAndAllocate(ctx context.Context, ep *types.RelayEndpoint
 func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKey []byte, selfLID, peerLID string, ep *types.RelayEndpoint) error {
 	log := e.c.log
 	selfParticipantID := rtp.FormatE2ESrtpParticipantID(selfLID)
+	peerParticipantID := rtp.FormatE2ESrtpParticipantID(peerLID)
 	ssrc, err := rtp.DeriveWasmParticipantSsrc(callID, selfParticipantID, 0, log)
 	if err != nil {
 		return err
@@ -149,16 +153,39 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	if err != nil {
 		return err
 	}
-	streamSsrcs, err := rtp.DeriveWasmRelayStreamSsrcs(callID, selfParticipantID, log)
+	selfStreamSsrcs, err := rtp.DeriveWasmRelayStreamSsrcs(callID, selfParticipantID, log)
 	if err != nil {
 		return err
 	}
-	ch, allocate, err := e.connectAndAllocate(ctx, ep, streamSsrcs)
+	// A WASM Allocate is a stream-subscription request. Describe the deterministic
+	// peer streams we want the relay to forward; our own RTP carries its SSRC and is
+	// learned independently by the relay. Advertising self streams here only yields
+	// the peer's short prefetch probe before the subscription is enforced.
+	peerStreamSsrcs, err := rtp.DeriveWasmRelayStreamSsrcs(callID, peerParticipantID, log)
+	if err != nil {
+		return err
+	}
+	ch, buildAllocate, err := e.connectAndAllocate(ctx, ep, peerStreamSsrcs)
 	if err != nil {
 		return err
 	}
 	defer ch.Close()
-
+	e.mu.Lock()
+	if m := e.calls[callID]; m != nil {
+		m.rebindRelay = func() {
+			if _, sendErr := ch.Send(buildAllocate()); sendErr == nil {
+				log.Info().Str("call_id", callID).Msg("resent relay allocation before incoming accept")
+			}
+		}
+	}
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		if m := e.calls[callID]; m != nil {
+			m.rebindRelay = nil
+		}
+		e.mu.Unlock()
+	}()
 	// Send a consent ping (0x0801) immediately, together with the allocate and BEFORE any
 	// RTP. The relay won't forward the peer's media until consent (ping → pong) is
 	// established; RTP sent before the first ping is dropped and the relay never bridges.
@@ -182,8 +209,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		Msg("media session")
 	e.c.diag.Emit("ssrc", map[string]any{
 		"call_id": callID, "ssrc": ssrc, "video_ssrc": videoSelfSsrc, "app_data_ssrc": appDataSelfSsrc,
-		"stream_ssrcs": streamSsrcs, "self_lid": selfLID,
-		"participant_id": selfParticipantID,
+		"self_stream_ssrcs": selfStreamSsrcs, "peer_stream_ssrcs": peerStreamSsrcs,
+		"self_lid": selfLID, "peer_lid": peerLID,
+		"participant_id": selfParticipantID, "peer_participant_id": peerParticipantID,
 	})
 
 	enc := mlow.NewMlowEncoder(mlow.WithLogger(log))
@@ -241,7 +269,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 	}()
 
-	// Keepalive: re-send the Allocate AND a WhatsApp ping (0x0801) ~1 Hz. This matches the
+	// Keepalive: send a fresh Allocate transaction AND a WhatsApp ping (0x0801) ~1 Hz. This matches the
 	// working capture exactly — allocate+ping every second, NO STUN binding-requests at
 	// all; the relay answers allocate-success + pong and bridges the peer's media.
 	// Binding-requests instead flip the relay into ICE-consent mode and the bridge never
@@ -259,6 +287,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			var tx [12]byte
 			_, _ = rand.Read(tx[:])
 			ping := stun.BuildWhatsappPing(tx, log)
+			allocate := buildAllocate()
 			if _, err := ch.Send(allocate); err != nil {
 				return
 			}
@@ -267,6 +296,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			e.c.diag.Emit("stun", map[string]any{
 				"event": "keepalive", "tick": tickCount,
 				"tx_id_hex": hex.EncodeToString(tx[:]), "ping_hex": hex.EncodeToString(ping[:]),
+				"allocate_tx_id_hex": hex.EncodeToString(allocate[8:20]),
 			})
 		}
 	}()
@@ -488,7 +518,8 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}()
 
 	buf := make([]byte, 1500)
-	var rtpIn, rtpSeen, unprotectFail, rtpInspect, vidIn, appDataIn, appDataUnprotectFail, videoUnprotectFail, videoFrameIn, videoSinkMissing, rtcpIn, rtcpAuthFail uint64
+	audioRtcpAnnounced := false
+	var rtpIn, rtpSeen, unprotectFail, rtpInspect, relayInspect, vidIn, appDataIn, appDataUnprotectFail, videoUnprotectFail, videoFrameIn, videoSinkMissing, rtcpIn, rtcpAuthFail uint64
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -500,6 +531,19 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		relayRx.Add(1)
 		pkt := buf[:n]
 		packetKind := relay.ClassifyRelayPacket(pkt)
+		if relayRx.Load() == 1 {
+			e.markMediaTransportReady(callID)
+		}
+		if relayInspect < 40 {
+			prefixLen := min(len(pkt), 24)
+			log.Info().
+				Uint64("packet", relayInspect).
+				Int("kind", int(packetKind)).
+				Int("bytes", n).
+				Str("prefix_hex", hex.EncodeToString(pkt[:prefixLen])).
+				Msg("relay inbound packet diagnostic")
+			relayInspect++
+		}
 		isRTP := packetKind == relay.RelayPacketRtp
 		e.c.diag.Emit("relay", map[string]any{
 			"event": "packet_in", "bytes": n, "is_rtp": isRTP,
@@ -523,6 +567,25 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			}
 			if rtcpIn++; rtcpIn == 1 {
 				log.Info().Uint32("ssrc", senderSsrc).Uint32("index", index).Msg("first authenticated peer SRTCP received")
+				// Mirror the native stream-attach sequence observed on the wire:
+				// SDES followed by compact PT=209 and PT=208 reports. A regular SR
+				// does not carry the same receive-subscription wire shape.
+				if packet, announceErr := audioRtcp.sourceDescription(); announceErr == nil {
+					if _, sendErr := ch.Send(packet); sendErr == nil {
+						audioRtcpAnnounced = true
+						log.Info().Str("call_id", callID).Msg("announced audio SRTCP session")
+					}
+				}
+				if packet, reportErr := audioRtcp.compactReport209(); reportErr == nil {
+					if _, sendErr := ch.Send(packet); sendErr == nil {
+						log.Info().Msg("sent compact PT=209 audio SRTCP report")
+					}
+				}
+				if packet, reportErr := audioRtcp.compactReport208(senderSsrc); reportErr == nil {
+					if _, sendErr := ch.Send(packet); sendErr == nil {
+						log.Info().Uint32("peer_ssrc", senderSsrc).Msg("sent compact PT=208 audio SRTCP report")
+					}
+				}
 			}
 			keyframe := rtp.RtcpRequestsKeyframe(plain, videoSelfSsrc)
 			if keyframe {
@@ -749,6 +812,25 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if rtpIn++; rtpIn == 1 {
 			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
+			// Register the receive stream with a complete authenticated RTCP report before
+			// final accept. The native stack creates its RTCP session and rebinds the relay
+			// before emitting <accept>; waiting for the periodic ticker leaves Android with
+			// no active receive subscription when it stops pre-accept probing.
+			nowMs := uint64(time.Now().UnixMilli())
+			report := audioReception.Report(nowMs)
+			if !audioRtcpAnnounced {
+				if packet, announceErr := audioRtcp.sourceDescription(); announceErr == nil {
+					if _, sendErr := ch.Send(packet); sendErr == nil {
+						audioRtcpAnnounced = true
+						log.Info().Str("call_id", callID).Msg("announced audio SRTCP session")
+					}
+				}
+			}
+			if packet, reportErr := audioRtcp.senderReport(txPipe.SenderStats(), nowMs, report); reportErr == nil {
+				if _, sendErr := ch.Send(packet); sendErr == nil {
+					log.Info().Str("call_id", callID).Msg("sent initial SRTCP report before incoming accept")
+				}
+			}
 			if call != nil {
 				call.setPhase(CallPhaseActive)
 				if fn := call.onReadyFn(); fn != nil {
@@ -863,8 +945,41 @@ func newMediaSrtcpSender(callKey []byte, selfLID string, ssrc uint32, profile bo
 	_, _ = rand.Read(entropy[:])
 	return &mediaSrtcpSender{
 		keys: keys, ssrc: ssrc, cname: rtp.BuildWhatsappRtcpCname(entropy),
-		profile: profile, index: 1,
+		profile: profile,
 	}, nil
+}
+
+func (s *mediaSrtcpSender) sourceDescription() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	plain := rtp.BuildSourceDescription(s.ssrc, &s.cname, s.profile)
+	packet, err := srtp.ProtectSrtcp(&s.keys, s.ssrc, s.index, plain[:])
+	if err == nil {
+		s.index++
+	}
+	return packet, err
+}
+
+func (s *mediaSrtcpSender) compactReport208(remoteSSRC uint32) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	plain := rtp.BuildCompactRtcp208(s.ssrc, remoteSSRC)
+	packet, err := srtp.ProtectSrtcp(&s.keys, s.ssrc, s.index, plain[:])
+	if err == nil {
+		s.index++
+	}
+	return packet, err
+}
+
+func (s *mediaSrtcpSender) compactReport209() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	plain := rtp.BuildCompactRtcp209(s.ssrc)
+	packet, err := srtp.ProtectSrtcp(&s.keys, s.ssrc, s.index, plain[:])
+	if err == nil {
+		s.index++
+	}
+	return packet, err
 }
 
 func (s *mediaSrtcpSender) senderReport(stats rtp.RtcpSenderStats, nowMs uint64, report *rtp.RtcpReceptionReport) ([]byte, error) {
