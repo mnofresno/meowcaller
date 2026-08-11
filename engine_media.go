@@ -531,9 +531,6 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		relayRx.Add(1)
 		pkt := buf[:n]
 		packetKind := relay.ClassifyRelayPacket(pkt)
-		if relayRx.Load() == 1 {
-			e.markMediaTransportReady(callID)
-		}
 		if relayInspect < 40 {
 			prefixLen := min(len(pkt), 24)
 			log.Info().
@@ -831,6 +828,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 					log.Info().Str("call_id", callID).Msg("sent initial SRTCP report before incoming accept")
 				}
 			}
+			e.markMediaTransportReady(callID)
 			if call != nil {
 				call.setPhase(CallPhaseActive)
 				if fn := call.onReadyFn(); fn != nil {
