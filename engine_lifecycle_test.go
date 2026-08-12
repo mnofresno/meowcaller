@@ -56,6 +56,7 @@ func TestIncomingAnswerWaitsForRelayTransport(t *testing.T) {
 	}
 	eng.markMediaTransportReady(call.ID())
 	eng.markMediaTransportReady(call.ID())
+	eng.onMute(&events.CallMute{BasicCallMeta: types.BasicCallMeta{CallID: call.ID()}, Muted: false})
 	if got, want := fmt.Sprint(order), "[rebind accept rebind]"; got != want {
 		t.Fatalf("answer order = %s, want %s", got, want)
 	}

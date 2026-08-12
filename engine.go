@@ -47,6 +47,8 @@ type engineCall struct {
 	answerRequested     bool
 	answerSent          bool
 	mediaTransportReady bool
+	remoteMuteSeen      bool
+	remoteMuted         bool
 	started             bool
 	ended               bool
 	cancel              context.CancelFunc
@@ -471,6 +473,8 @@ func (e *engine) onMute(ev *events.CallMute) {
 	m := e.calls[ev.CallID]
 	var call *Call
 	if m != nil {
+		m.remoteMuteSeen = true
+		m.remoteMuted = ev.Muted
 		call = m.call
 	}
 	e.mu.Unlock()
@@ -478,6 +482,9 @@ func (e *engine) onMute(ev *events.CallMute) {
 		if fn := call.onMuteStateFn(); fn != nil {
 			fn(ev.Muted)
 		}
+	}
+	if !ev.Muted {
+		e.maybeAcceptIncoming(ev.CallID)
 	}
 }
 
@@ -578,7 +585,7 @@ func (e *engine) answer(c *Call) error {
 func (e *engine) maybeAcceptIncoming(callID string) {
 	e.mu.Lock()
 	m := e.calls[callID]
-	if m == nil || m.ended || !m.answerRequested || !m.mediaTransportReady || m.answerSent {
+	if m == nil || m.ended || !m.answerRequested || !m.mediaTransportReady || !m.remoteMuteSeen || m.remoteMuted || m.answerSent {
 		e.mu.Unlock()
 		return
 	}
