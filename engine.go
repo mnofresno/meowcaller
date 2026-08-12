@@ -459,7 +459,10 @@ func (e *engine) onMediaReady(ev *events.CallMediaReady) {
 	e.c.diag.Emit("meta", map[string]any{
 		"event": "media_ready", "call_id": ev.CallID, "self_lid": ev.SelfLID.String(),
 		"peer_lid": ev.PeerLID.String(), "codec": ev.Codec.String(), "video": ev.Video,
+		"relay_candidates": len(ev.RelayCandidates),
 	})
+	e.c.log.Info().Str("call_id", ev.CallID).Str("relay", relay.RelayName).
+		Int("relay_candidates", len(ev.RelayCandidates)).Msg("media relay candidates received")
 	e.maybeStartMedia(ev.CallID)
 }
 
@@ -592,6 +595,15 @@ func (e *engine) maybeAcceptIncoming(callID string) {
 	if err := e.acceptCall(context.Background(), callID); err != nil {
 		e.c.log.Warn().Err(err).Str("call_id", callID).Msg("failed to accept relay-ready incoming call")
 		e.finishCall(callID, "accept_failed")
+		return
+	}
+	// The pre-accept Allocate keeps the initial relay probe alive, but it is not
+	// necessarily the subscription used after the peer switches to the accepted
+	// call. Re-announce it immediately after the accept instead of waiting for
+	// the one-second keepalive tick.
+	if rebind != nil {
+		rebind()
+		e.c.log.Info().Str("call_id", callID).Msg("resent relay allocation after incoming accept")
 	}
 }
 

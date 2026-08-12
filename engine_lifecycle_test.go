@@ -56,7 +56,7 @@ func TestIncomingAnswerWaitsForRelayTransport(t *testing.T) {
 	}
 	eng.markMediaTransportReady(call.ID())
 	eng.markMediaTransportReady(call.ID())
-	if got, want := fmt.Sprint(order), "[rebind accept]"; got != want {
+	if got, want := fmt.Sprint(order), "[rebind accept rebind]"; got != want {
 		t.Fatalf("answer order = %s, want %s", got, want)
 	}
 }
