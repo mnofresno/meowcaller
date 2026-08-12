@@ -40,6 +40,13 @@ func TestIncomingAnswerWaitsForRelayTransport(t *testing.T) {
 	eng, call := testEngineWithIncomingCall()
 	var order []string
 	eng.calls[call.ID()].rebindRelay = func() { order = append(order, "rebind") }
+	eng.setCallMute = func(_ context.Context, callID string, muted bool) error {
+		if callID != call.ID() || muted {
+			t.Fatalf("reannounced mute = (%q, %v), want (%q, false)", callID, muted, call.ID())
+		}
+		order = append(order, "unmute")
+		return nil
+	}
 	eng.acceptCall = func(_ context.Context, callID string) error {
 		if callID != call.ID() {
 			t.Fatalf("accepted call %q, want %q", callID, call.ID())
@@ -57,7 +64,7 @@ func TestIncomingAnswerWaitsForRelayTransport(t *testing.T) {
 	eng.markMediaTransportReady(call.ID())
 	eng.markMediaTransportReady(call.ID())
 	eng.onMute(&events.CallMute{BasicCallMeta: types.BasicCallMeta{CallID: call.ID()}, Muted: false})
-	if got, want := fmt.Sprint(order), "[rebind accept rebind]"; got != want {
+	if got, want := fmt.Sprint(order), "[rebind accept unmute rebind]"; got != want {
 		t.Fatalf("answer order = %s, want %s", got, want)
 	}
 }

@@ -604,6 +604,16 @@ func (e *engine) maybeAcceptIncoming(callID string) {
 		e.finishCall(callID, "accept_failed")
 		return
 	}
+	// Repeat the local unmuted state after accept. Some mobile clients keep
+	// their encoder in DTX until they observe the accepted call's mute_v2 state;
+	// the pre-accept announcement alone is not sufficient for that transition.
+	if e.setCallMute != nil {
+		if err := e.setCallMute(context.Background(), callID, false); err != nil {
+			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("failed to reannounce local unmute after accept")
+		} else {
+			e.c.log.Info().Str("call_id", callID).Msg("reannounced local unmute after incoming accept")
+		}
+	}
 	// The pre-accept Allocate keeps the initial relay probe alive, but it is not
 	// necessarily the subscription used after the peer switches to the accepted
 	// call. Re-announce it immediately after the accept instead of waiting for
