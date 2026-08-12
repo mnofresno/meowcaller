@@ -165,10 +165,8 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	if err != nil {
 		return err
 	}
-	// Experiment A4: advertise the local participant stream descriptors. The
-	// relay may use this participant identity as the subscription key even when
-	// it forwards the peer's RTP; keep this switch isolated for live comparison.
-	ch, buildAllocate, err := e.connectAndAllocate(ctx, ep, selfStreamSsrcs)
+	// Return to the peer subscription for the controlled A9 audio-injection run.
+	ch, buildAllocate, err := e.connectAndAllocate(ctx, ep, peerStreamSsrcs)
 	if err != nil {
 		return err
 	}
